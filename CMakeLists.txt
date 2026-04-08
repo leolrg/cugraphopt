@@ -18,6 +18,7 @@ include(CTest)
 
 add_library(cugraphopt_core
   src/core.cpp
+  src/pose_graph.cpp
   src/core.cu
 )
 
@@ -50,3 +51,28 @@ target_link_libraries(cugraphopt_smoke
 )
 
 add_test(NAME cugraphopt_smoke COMMAND cugraphopt_smoke)
+
+add_test(
+  NAME cugraphopt_cli_parser
+  COMMAND cugraphopt ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/sample_pose_graph.g2o
+)
+
+set_tests_properties(cugraphopt_cli_parser PROPERTIES
+  PASS_REGULAR_EXPRESSION "nodes=2 edges=1"
+)
+
+add_executable(cugraphopt_parser_test
+  tests/parser_test.cpp
+)
+
+target_link_libraries(cugraphopt_parser_test
+  PRIVATE
+    cugraphopt_core
+)
+
+target_compile_definitions(cugraphopt_parser_test
+  PRIVATE
+    CUGRAPHOPT_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+)
+
+add_test(NAME cugraphopt_parser_test COMMAND cugraphopt_parser_test)
