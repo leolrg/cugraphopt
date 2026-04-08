@@ -58,7 +58,7 @@ Expected initial files:
 The root `CMakeLists.txt` will:
 
 - declare `project(CuGraphOpt LANGUAGES CXX CUDA)`
-- require C++17 and CUDA 17
+- require C++17 for host code and set the CUDA language standard to 17 for `.cu` compilation units; this refers to `CMAKE_CXX_STANDARD` and `CMAKE_CUDA_STANDARD`, not a CUDA Toolkit version
 - enable testing via `include(CTest)`
 - define a default CUDA architecture list only when the user has not already provided one
 - build `cugraphopt_core` as the primary library target
