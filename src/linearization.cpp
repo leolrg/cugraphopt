@@ -33,11 +33,46 @@ se3 compute_residual(const SE3& T_i, const SE3& T_j, const SE3& Z_ij) {
   return log(E);
 }
 
-void compute_jacobians(const SE3& /*T_i*/, const SE3& /*T_j*/,
-                       const SE3& /*Z_ij*/, Mat6& J_i, Mat6& J_j) {
-  // Stub — filled in Task 3.
+namespace {
+constexpr double kFiniteDiffEps = 1e-8;
+}  // namespace
+
+void compute_jacobians(const SE3& T_i, const SE3& T_j, const SE3& Z_ij,
+                       Mat6& J_i, Mat6& J_j) {
   J_i = {};
   J_j = {};
+
+  for (int k = 0; k < 6; ++k) {
+    se3 delta{};
+
+    // J_i column k: right-perturb T_i
+    delta[k] = kFiniteDiffEps;
+    const SE3 T_i_plus = compose(T_i, exp(delta));
+    delta[k] = -kFiniteDiffEps;
+    const SE3 T_i_minus = compose(T_i, exp(delta));
+
+    const se3 ri_plus = compute_residual(T_i_plus, T_j, Z_ij);
+    const se3 ri_minus = compute_residual(T_i_minus, T_j, Z_ij);
+
+    for (int row = 0; row < 6; ++row) {
+      J_i[row * 6 + k] =
+          (ri_plus[row] - ri_minus[row]) / (2.0 * kFiniteDiffEps);
+    }
+
+    // J_j column k: right-perturb T_j
+    delta[k] = kFiniteDiffEps;
+    const SE3 T_j_plus = compose(T_j, exp(delta));
+    delta[k] = -kFiniteDiffEps;
+    const SE3 T_j_minus = compose(T_j, exp(delta));
+
+    const se3 rj_plus = compute_residual(T_i, T_j_plus, Z_ij);
+    const se3 rj_minus = compute_residual(T_i, T_j_minus, Z_ij);
+
+    for (int row = 0; row < 6; ++row) {
+      J_j[row * 6 + k] =
+          (rj_plus[row] - rj_minus[row]) / (2.0 * kFiniteDiffEps);
+    }
+  }
 }
 
 LinearizationResult linearize(const PoseGraph& /*graph*/) {
