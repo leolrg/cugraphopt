@@ -20,6 +20,7 @@ add_library(cugraphopt_core
   src/core.cpp
   src/pose_graph.cpp
   src/se3.cpp
+  src/linearization.cpp
   src/core.cu
 )
 
@@ -88,3 +89,14 @@ target_link_libraries(cugraphopt_se3_test
 )
 
 add_test(NAME cugraphopt_se3_test COMMAND cugraphopt_se3_test)
+
+add_executable(cugraphopt_linearization_test
+  tests/linearization_test.cpp
+)
+
+target_link_libraries(cugraphopt_linearization_test
+  PRIVATE
+    cugraphopt_core
+)
+
+add_test(NAME cugraphopt_linearization_test COMMAND cugraphopt_linearization_test)
