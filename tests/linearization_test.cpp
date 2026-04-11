@@ -125,6 +125,85 @@ void test_jacobians_identity_case() {
   }
 }
 
+void test_linearize_two_nodes_consistent() {
+  using namespace cugraphopt;
+
+  PoseGraph graph;
+  graph.nodes.push_back({0, 0, 0, 0, 0, 0, 0, 1});
+  graph.nodes.push_back({1, 1, 0, 0, 0, 0, 0, 1});
+
+  Pose3Edge edge;
+  edge.from = 0;
+  edge.to = 1;
+  edge.x = 1;
+  edge.y = 0;
+  edge.z = 0;
+  edge.qx = 0;
+  edge.qy = 0;
+  edge.qz = 0;
+  edge.qw = 1;
+  edge.information = {};
+  edge.information[0] = 1;
+  edge.information[6] = 1;
+  edge.information[11] = 1;
+  edge.information[15] = 1;
+  edge.information[18] = 1;
+  edge.information[20] = 1;
+  graph.edges.push_back(edge);
+
+  const auto result = linearize(graph);
+
+  assert(result.dim == 12);
+  assert(static_cast<int>(result.H.size()) == 12 * 12);
+  assert(static_cast<int>(result.b.size()) == 12);
+  assert(near(result.total_error, 0.0, 1e-10));
+
+  double h_diag_sum = 0;
+  for (int i = 0; i < 12; ++i) {
+    h_diag_sum += std::abs(result.H[i * 12 + i]);
+  }
+  assert(h_diag_sum > 0.1);
+}
+
+void test_linearize_two_nodes_with_error() {
+  using namespace cugraphopt;
+
+  PoseGraph graph;
+  graph.nodes.push_back({0, 0, 0, 0, 0, 0, 0, 1});
+  graph.nodes.push_back({1, 2, 0, 0, 0, 0, 0, 1});
+
+  Pose3Edge edge;
+  edge.from = 0;
+  edge.to = 1;
+  edge.x = 1;
+  edge.y = 0;
+  edge.z = 0;
+  edge.qx = 0;
+  edge.qy = 0;
+  edge.qz = 0;
+  edge.qw = 1;
+  edge.information = {};
+  edge.information[0] = 1;
+  edge.information[6] = 1;
+  edge.information[11] = 1;
+  edge.information[15] = 1;
+  edge.information[18] = 1;
+  edge.information[20] = 1;
+  graph.edges.push_back(edge);
+
+  const auto result = linearize(graph);
+
+  assert(result.dim == 12);
+  assert(near(result.total_error, 1.0, 1e-6));
+  assert(std::isfinite(result.total_error));
+
+  double b_norm_sq = 0;
+  for (int i = 0; i < 12; ++i) {
+    b_norm_sq += result.b[i] * result.b[i];
+  }
+  assert(b_norm_sq > 1e-10);
+}
+
 }  // namespace
 
 int main() {
@@ -134,5 +213,7 @@ int main() {
   test_residual_with_error();
   test_jacobians_dimensions();
   test_jacobians_identity_case();
+  test_linearize_two_nodes_consistent();
+  test_linearize_two_nodes_with_error();
   return 0;
 }
