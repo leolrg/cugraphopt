@@ -100,3 +100,12 @@ target_link_libraries(cugraphopt_linearization_test
 )
 
 add_test(NAME cugraphopt_linearization_test COMMAND cugraphopt_linearization_test)
+
+add_test(
+  NAME cugraphopt_cli_linearize
+  COMMAND cugraphopt --linearize ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/sample_pose_graph.g2o
+)
+
+set_tests_properties(cugraphopt_cli_linearize PROPERTIES
+  PASS_REGULAR_EXPRESSION "nodes=2 edges=1 dim=12 error="
+)
