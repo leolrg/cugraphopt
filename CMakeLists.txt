@@ -23,6 +23,7 @@ add_library(cugraphopt_core
   src/pose_graph.cpp
   src/se3.cpp
   src/linearization.cpp
+  src/solver.cpp
   src/core.cu
 )
 
@@ -110,4 +111,30 @@ add_test(
 
 set_tests_properties(cugraphopt_cli_linearize PROPERTIES
   PASS_REGULAR_EXPRESSION "nodes=2 edges=1 dim=12 error="
+)
+
+add_executable(cugraphopt_solver_test
+  tests/solver_test.cpp
+)
+
+target_link_libraries(cugraphopt_solver_test
+  PRIVATE
+    cugraphopt_core
+)
+
+target_compile_definitions(cugraphopt_solver_test
+  PRIVATE
+    CUGRAPHOPT_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+    CUGRAPHOPT_DATASET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/datasets"
+)
+
+add_test(NAME cugraphopt_solver_test COMMAND cugraphopt_solver_test)
+
+add_test(
+  NAME cugraphopt_cli_solve
+  COMMAND cugraphopt --solve ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/sample_pose_graph.g2o
+)
+
+set_tests_properties(cugraphopt_cli_solve PROPERTIES
+  PASS_REGULAR_EXPRESSION "converged"
 )
