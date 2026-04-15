@@ -24,6 +24,7 @@ add_library(cugraphopt_core
   src/se3.cpp
   src/linearization.cpp
   src/solver.cpp
+  src/bsr.cpp
   src/core.cu
 )
 
@@ -138,3 +139,14 @@ add_test(
 set_tests_properties(cugraphopt_cli_solve PROPERTIES
   PASS_REGULAR_EXPRESSION "converged"
 )
+
+add_executable(cugraphopt_bsr_test
+  tests/bsr_test.cpp
+)
+
+target_link_libraries(cugraphopt_bsr_test
+  PRIVATE
+    cugraphopt_core
+)
+
+add_test(NAME cugraphopt_bsr_test COMMAND cugraphopt_bsr_test)
