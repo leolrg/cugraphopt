@@ -1,5 +1,6 @@
 #pragma once
 
+#include "cugraphopt/bsr.hpp"
 #include "cugraphopt/linearization.hpp"
 #include "cugraphopt/pose_graph.hpp"
 #include "cugraphopt/se3.hpp"
@@ -50,8 +51,16 @@ struct GNResult {
   std::vector<GNIterationStats> stats;
 };
 
-/// Run the full Gauss-Newton optimization on a pose graph.
+/// Run the full Gauss-Newton optimization on a pose graph (dense Cholesky).
 /// Modifies graph.nodes in-place to the optimized poses.
 GNResult solve_gauss_newton(PoseGraph& graph, const GNConfig& config);
+
+/// Apply gauge fix to a BSR Hessian: zero first pose's rows/cols, set diagonal
+/// to identity, and zero the first 6 gradient entries.
+void apply_gauge_fix_bsr(BSRMatrix& bsr, std::vector<double>& b);
+
+/// Run sparse Gauss-Newton optimization using BSR assembly + PCG solver.
+/// Modifies graph.nodes in-place to the optimized poses.
+GNResult solve_gauss_newton_sparse(PoseGraph& graph, const GNConfig& config);
 
 }  // namespace cugraphopt

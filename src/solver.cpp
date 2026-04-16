@@ -1,4 +1,5 @@
 #include "cugraphopt/solver.hpp"
+#include "cugraphopt/bsr.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -216,6 +217,145 @@ GNResult solve_gauss_newton(PoseGraph& graph, const GNConfig& config) {
     if (iter > 0) {
       double prev_error = result.stats[iter - 1].error;
       double rel_change = std::abs(lin.total_error - prev_error) /
+                          (std::abs(prev_error) + 1e-30);
+      if (rel_change < config.error_tolerance) {
+        if (config.verbose) {
+          std::printf("  -> converged (error stagnation, rel=%.2e)\n",
+                      rel_change);
+        }
+        break;
+      }
+    }
+  }
+
+  return result;
+}
+
+void apply_gauge_fix_bsr(BSRMatrix& bsr, std::vector<double>& b) {
+  const int N = bsr.num_block_rows;
+
+  // Zero first 6 gradient entries.
+  for (int i = 0; i < 6; ++i) b[i] = 0.0;
+
+  // Zero all blocks in row 0.
+  for (int k = bsr.row_ptr[0]; k < bsr.row_ptr[0 + 1]; ++k) {
+    double* blk = bsr.block(k);
+    for (int a = 0; a < 36; ++a) blk[a] = 0.0;
+    if (bsr.col_idx[k] == 0) {
+      for (int a = 0; a < 6; ++a) blk[a * 6 + a] = 1.0;
+    }
+  }
+
+  // Zero column-0 blocks in all other rows.
+  for (int i = 1; i < N; ++i) {
+    int k = bsr.find_block(i, 0);
+    if (k >= 0) {
+      double* blk = bsr.block(k);
+      for (int a = 0; a < 36; ++a) blk[a] = 0.0;
+    }
+  }
+}
+
+GNResult solve_gauss_newton_sparse(PoseGraph& graph, const GNConfig& config) {
+  using Clock = std::chrono::high_resolution_clock;
+
+  GNResult result{};
+
+  // Build symbolic BSR structure once (topology doesn't change).
+  BSRMatrix bsr = bsr_symbolic(graph);
+
+  if (config.verbose) {
+    std::printf("BSR: %d block-rows, %d non-zero blocks (%.1f%% fill)\n",
+                bsr.num_block_rows, bsr.nnz_blocks,
+                100.0 * bsr.nnz_blocks /
+                    (static_cast<double>(bsr.num_block_rows) * bsr.num_block_rows));
+  }
+
+  for (int iter = 0; iter < config.max_iterations; ++iter) {
+    GNIterationStats stats{};
+    stats.iteration = iter;
+
+    auto t_total_start = Clock::now();
+
+    // --- Sparse linearization + assembly ---
+    auto t0 = Clock::now();
+    std::vector<double> gradient;
+    double total_error = bsr_assemble(bsr, gradient, graph);
+    auto t1 = Clock::now();
+    stats.linearize_ms =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    if (iter == 0) {
+      result.initial_error = total_error;
+    }
+    stats.error = total_error;
+
+    int dim = 6 * bsr.num_block_rows;
+
+    // Check gradient convergence.
+    double grad_max = 0.0;
+    for (int i = 0; i < dim; ++i) {
+      grad_max = std::max(grad_max, std::abs(gradient[i]));
+    }
+
+    if (config.verbose) {
+      std::printf("iter %3d  error=%.6e  |grad|_inf=%.6e  linearize=%.1fms",
+                  iter, total_error, grad_max, stats.linearize_ms);
+    }
+
+    if (grad_max < config.gradient_tolerance) {
+      if (config.verbose) {
+        std::printf("  -> converged (gradient)\n");
+      }
+      result.final_error = total_error;
+      result.iterations = iter;
+      result.stats.push_back(stats);
+      break;
+    }
+
+    // --- Solve with PCG ---
+    auto t2 = Clock::now();
+    apply_gauge_fix_bsr(bsr, gradient);
+
+    // rhs = -b
+    std::vector<double> rhs(dim);
+    for (int i = 0; i < dim; ++i) rhs[i] = -gradient[i];
+
+    std::vector<double> dx;
+    int pcg_iters = pcg_solve(bsr, rhs, dx, 300, 1e-8);
+    auto t3 = Clock::now();
+    stats.solve_ms =
+        std::chrono::duration<double, std::milli>(t3 - t2).count();
+
+    if (config.verbose) {
+      std::printf("  pcg=%d", pcg_iters);
+    }
+
+    // --- Retract ---
+    auto t4 = Clock::now();
+    retract_poses(graph, dx);
+    auto t5 = Clock::now();
+    stats.retract_ms =
+        std::chrono::duration<double, std::milli>(t5 - t4).count();
+
+    auto t_total_end = Clock::now();
+    stats.total_ms =
+        std::chrono::duration<double, std::milli>(t_total_end - t_total_start)
+            .count();
+
+    if (config.verbose) {
+      std::printf("  solve=%.1fms  retract=%.1fms  total=%.1fms\n",
+                  stats.solve_ms, stats.retract_ms, stats.total_ms);
+    }
+
+    result.stats.push_back(stats);
+    result.final_error = total_error;
+    result.iterations = iter + 1;
+
+    // Check error convergence.
+    if (iter > 0) {
+      double prev_error = result.stats[iter - 1].error;
+      double rel_change = std::abs(total_error - prev_error) /
                           (std::abs(prev_error) + 1e-30);
       if (rel_change < config.error_tolerance) {
         if (config.verbose) {

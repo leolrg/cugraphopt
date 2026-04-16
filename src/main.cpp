@@ -40,12 +40,29 @@ int main(int argc, char** argv) {
     cfg.max_iterations = 30;
     cfg.verbose = true;
 
+    cugraphopt::GNResult res =
+        cugraphopt::solve_gauss_newton_sparse(graph, cfg);
+    std::printf("converged: %d iterations, error %.6e -> %.6e\n",
+                res.iterations, res.initial_error, res.final_error);
+    return 0;
+  }
+
+  if (argc == 3 && std::string(argv[1]) == "--solve-dense") {
+    cugraphopt::PoseGraph graph = cugraphopt::load_pose_graph(argv[2]);
+    std::printf("Loaded: nodes=%zu edges=%zu\n", graph.nodes.size(),
+                graph.edges.size());
+
+    cugraphopt::GNConfig cfg;
+    cfg.max_iterations = 30;
+    cfg.verbose = true;
+
     cugraphopt::GNResult res = cugraphopt::solve_gauss_newton(graph, cfg);
     std::printf("converged: %d iterations, error %.6e -> %.6e\n",
                 res.iterations, res.initial_error, res.final_error);
     return 0;
   }
 
-  std::cerr << "Usage: cugraphopt [--linearize|--solve] [pose_graph.g2o]\n";
+  std::cerr << "Usage: cugraphopt [--linearize|--solve|--solve-dense] "
+               "[pose_graph.g2o]\n";
   return 1;
 }
