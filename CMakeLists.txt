@@ -25,6 +25,7 @@ add_library(cugraphopt_core
   src/linearization.cpp
   src/solver.cpp
   src/bsr.cpp
+  src/graph_color.cpp
   src/core.cu
 )
 
@@ -150,3 +151,19 @@ target_link_libraries(cugraphopt_bsr_test
 )
 
 add_test(NAME cugraphopt_bsr_test COMMAND cugraphopt_bsr_test)
+
+add_executable(cugraphopt_graph_color_test
+  tests/graph_color_test.cpp
+)
+
+target_link_libraries(cugraphopt_graph_color_test
+  PRIVATE
+    cugraphopt_core
+)
+
+target_compile_definitions(cugraphopt_graph_color_test
+  PRIVATE
+    CUGRAPHOPT_DATASET_DIR="${CMAKE_CURRENT_SOURCE_DIR}/datasets"
+)
+
+add_test(NAME cugraphopt_graph_color_test COMMAND cugraphopt_graph_color_test)
