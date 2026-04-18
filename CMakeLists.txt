@@ -167,3 +167,14 @@ target_compile_definitions(cugraphopt_graph_color_test
 )
 
 add_test(NAME cugraphopt_graph_color_test COMMAND cugraphopt_graph_color_test)
+
+add_executable(cugraphopt_se3_device_test
+  tests/se3_device_test.cu
+)
+
+target_link_libraries(cugraphopt_se3_device_test
+  PRIVATE
+    cugraphopt_core
+)
+
+add_test(NAME cugraphopt_se3_device_test COMMAND cugraphopt_se3_device_test)
