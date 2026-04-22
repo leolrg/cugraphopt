@@ -26,6 +26,7 @@ add_library(cugraphopt_core
   src/solver.cpp
   src/bsr.cpp
   src/graph_color.cpp
+  src/cuda_solver.cu
   src/core.cu
 )
 
@@ -178,3 +179,12 @@ target_link_libraries(cugraphopt_se3_device_test
 )
 
 add_test(NAME cugraphopt_se3_device_test COMMAND cugraphopt_se3_device_test)
+
+add_test(
+  NAME cugraphopt_cli_solve_gpu
+  COMMAND cugraphopt --solve-gpu ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/sample_pose_graph.g2o
+)
+
+set_tests_properties(cugraphopt_cli_solve_gpu PROPERTIES
+  PASS_REGULAR_EXPRESSION "converged"
+)
