@@ -990,4 +990,209 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config) {
   return result;
 }
 
+// ============================================================================
+// Levenberg-Marquardt damping kernel
+// ============================================================================
+
+__global__ void add_damping_kernel(double* __restrict__ bsr_values,
+                                    const int* __restrict__ row_ptr,
+                                    const int* __restrict__ col_idx,
+                                    double lambda, int N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+
+  // Find diagonal block for row i.
+  for (int k = row_ptr[i]; k < row_ptr[i + 1]; ++k) {
+    if (col_idx[k] == i) {
+      double* blk = bsr_values + k * 36;
+      for (int d = 0; d < 6; ++d) {
+        blk[d * 6 + d] += lambda * blk[d * 6 + d];
+      }
+      return;
+    }
+  }
+}
+
+static void cuda_add_damping(DeviceBSR& dbsr, double lambda) {
+  int threads = 256;
+  int blocks = (dbsr.num_block_rows + threads - 1) / threads;
+  add_damping_kernel<<<blocks, threads>>>(
+      dbsr.d_values, dbsr.d_row_ptr, dbsr.d_col_idx, lambda,
+      dbsr.num_block_rows);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+GNResult solve_lm_gpu(PoseGraph& graph, const GNConfig& config) {
+  using Clock = std::chrono::high_resolution_clock;
+
+  GNResult result{};
+  int N = static_cast<int>(graph.nodes.size());
+  int dim = 6 * N;
+
+  EdgeColoring coloring = color_edges(graph);
+  BSRMatrix bsr_host = bsr_symbolic(graph);
+  DevicePoseGraph dpg = create_device_pose_graph(graph);
+  DeviceBSR dbsr = create_device_bsr(bsr_host);
+
+  // Build flat color-edge list.
+  std::vector<int> flat_color_edges;
+  for (int c = 0; c < coloring.num_colors; ++c) {
+    for (int e : coloring.color_edges[c]) {
+      flat_color_edges.push_back(e);
+    }
+  }
+  int* d_color_edges;
+  int* d_color_offsets;
+  std::vector<int> color_offsets = {0};
+  for (int c = 0; c < coloring.num_colors; ++c) {
+    color_offsets.push_back(color_offsets.back() +
+                            static_cast<int>(coloring.color_edges[c].size()));
+  }
+  CUDA_CHECK(cudaMalloc(&d_color_edges, flat_color_edges.size() * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_color_offsets, color_offsets.size() * sizeof(int)));
+  CUDA_CHECK(cudaMemcpy(d_color_edges, flat_color_edges.data(),
+                        flat_color_edges.size() * sizeof(int),
+                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_color_offsets, color_offsets.data(),
+                        color_offsets.size() * sizeof(int),
+                        cudaMemcpyHostToDevice));
+
+  double* d_gradient;
+  double* d_dx;
+  double* d_rhs;
+  CUDA_CHECK(cudaMalloc(&d_gradient, dim * sizeof(double)));
+  CUDA_CHECK(cudaMalloc(&d_dx, dim * sizeof(double)));
+  CUDA_CHECK(cudaMalloc(&d_rhs, dim * sizeof(double)));
+
+  // LM parameters.
+  double lambda = 1e-4;
+  double nu = 2.0;
+  double prev_error = 1e30;
+
+  if (config.verbose) {
+    std::printf("LM-GPU: %d nodes, %d edges, %d BSR blocks, %d colors\n",
+                N, dpg.num_edges, dbsr.nnz_blocks, coloring.num_colors);
+  }
+
+  // Save poses for potential rollback.
+  std::vector<double> h_poses_backup(N * 12);
+
+  for (int iter = 0; iter < config.max_iterations; ++iter) {
+    GNIterationStats stats{};
+    stats.iteration = iter;
+    auto t_total_start = Clock::now();
+
+    // --- Linearize + assemble ---
+    cuda_linearize_edges(dpg);
+    cuda_assemble_colored(dpg, dbsr, d_gradient, coloring,
+                          d_color_edges, d_color_offsets);
+
+    double total_error = cuda_compute_error(dpg);
+
+    if (iter == 0) {
+      result.initial_error = total_error;
+      prev_error = total_error;
+    }
+    stats.error = total_error;
+
+    // Check gradient.
+    std::vector<double> h_gradient(dim);
+    CUDA_CHECK(cudaMemcpy(h_gradient.data(), d_gradient, dim * sizeof(double),
+                          cudaMemcpyDeviceToHost));
+    double grad_max = 0.0;
+    for (int i = 0; i < dim; ++i) grad_max = std::max(grad_max, std::abs(h_gradient[i]));
+
+    if (config.verbose) {
+      std::printf("iter %3d  error=%.6e  |grad|=%.2e  lambda=%.2e",
+                  iter, total_error, grad_max, lambda);
+    }
+
+    if (grad_max < config.gradient_tolerance) {
+      if (config.verbose) std::printf("  -> converged (gradient)\n");
+      result.final_error = total_error;
+      result.iterations = iter;
+      result.stats.push_back(stats);
+      break;
+    }
+
+    // Save poses for rollback.
+    CUDA_CHECK(cudaMemcpy(h_poses_backup.data(), dpg.d_poses,
+                          N * 12 * sizeof(double), cudaMemcpyDeviceToHost));
+
+    // --- Add LM damping ---
+    cuda_add_damping(dbsr, lambda);
+
+    // --- Gauge fix + solve ---
+    cuda_gauge_fix(dbsr, d_gradient);
+    cuda_copy(d_rhs, d_gradient, dim);
+    cuda_scale(-1.0, d_rhs, dim);
+
+    int pcg_iters = cuda_pcg_solve(dbsr, d_rhs, d_dx, dim, 300, 1e-8);
+
+    // --- Retract (tentative) ---
+    cuda_retract(dpg, d_dx);
+
+    // --- Evaluate new error ---
+    cuda_linearize_edges(dpg);
+    double new_error = cuda_compute_error(dpg);
+
+    auto t_total_end = Clock::now();
+    stats.total_ms = std::chrono::duration<double, std::milli>(
+        t_total_end - t_total_start).count();
+
+    if (new_error < total_error) {
+      // Accept step, decrease lambda.
+      lambda = std::max(lambda / 3.0, 1e-10);
+      nu = 2.0;
+      prev_error = new_error;
+
+      if (config.verbose) {
+        std::printf("  pcg=%d  new_err=%.4e  ACCEPT  total=%.1fms\n",
+                    pcg_iters, new_error, stats.total_ms);
+      }
+    } else {
+      // Reject step, increase lambda, restore poses.
+      CUDA_CHECK(cudaMemcpy(dpg.d_poses, h_poses_backup.data(),
+                            N * 12 * sizeof(double), cudaMemcpyHostToDevice));
+      lambda *= nu;
+      nu *= 2.0;
+
+      if (config.verbose) {
+        std::printf("  pcg=%d  new_err=%.4e  REJECT  total=%.1fms\n",
+                    pcg_iters, new_error, stats.total_ms);
+      }
+    }
+
+    result.stats.push_back(stats);
+    result.final_error = std::min(total_error, new_error);
+    result.iterations = iter + 1;
+
+    // Error convergence.
+    if (iter > 0) {
+      double rel_change = std::abs(total_error - prev_error) /
+                          (std::abs(prev_error) + 1e-30);
+      if (rel_change < config.error_tolerance && new_error <= total_error) {
+        if (config.verbose) {
+          std::printf("  -> converged (error stagnation, rel=%.2e)\n", rel_change);
+        }
+        break;
+      }
+    }
+    prev_error = total_error;
+  }
+
+  // Read back optimized poses.
+  read_back_poses(dpg, graph);
+
+  cudaFree(d_gradient);
+  cudaFree(d_dx);
+  cudaFree(d_rhs);
+  cudaFree(d_color_edges);
+  cudaFree(d_color_offsets);
+  free_device_pose_graph(dpg);
+  free_device_bsr(dbsr);
+
+  return result;
+}
+
 }  // namespace cugraphopt
