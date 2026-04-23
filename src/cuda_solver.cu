@@ -606,11 +606,39 @@ void cuda_precond_apply(const double* d_diag_inv, const double* d_r,
   CUDA_CHECK(cudaGetLastError());
 }
 
+// ---- Fast dot product with pre-allocated buffer --------------------------
+
+// Uses a persistent device scalar to avoid per-call malloc.
+static double fast_dot(const double* d_a, const double* d_b, int dim,
+                       double* d_scratch) {
+  CUDA_CHECK(cudaMemsetAsync(d_scratch, 0, sizeof(double)));
+  int threads = 256;
+  int blocks = (dim + threads - 1) / threads;
+  dot_kernel<<<blocks, threads, threads * sizeof(double)>>>(
+      d_a, d_b, d_scratch, dim);
+  double result;
+  CUDA_CHECK(cudaMemcpy(&result, d_scratch, sizeof(double),
+                        cudaMemcpyDeviceToHost));
+  return result;
+}
+
 // ---- GPU PCG solver -------------------------------------------------------
 
 int cuda_pcg_solve(const DeviceBSR& dbsr, const double* d_rhs,
                    double* d_dx, int dim, int max_iter, double tol) {
   int N = dbsr.num_block_rows;
+
+  // Pre-allocate all buffers at once.
+  double* d_r;
+  double* d_z;
+  double* d_p;
+  double* d_Ap;
+  double* d_scratch;  // persistent scalar for reductions
+  CUDA_CHECK(cudaMalloc(&d_r, dim * sizeof(double)));
+  CUDA_CHECK(cudaMalloc(&d_z, dim * sizeof(double)));
+  CUDA_CHECK(cudaMalloc(&d_p, dim * sizeof(double)));
+  CUDA_CHECK(cudaMalloc(&d_Ap, dim * sizeof(double)));
+  CUDA_CHECK(cudaMalloc(&d_scratch, sizeof(double)));
 
   // dx = 0
   cuda_fill(d_dx, 0.0, dim);
@@ -619,31 +647,21 @@ int cuda_pcg_solve(const DeviceBSR& dbsr, const double* d_rhs,
   double* d_diag_inv = cuda_extract_diagonal_inv(dbsr);
 
   // r = rhs (since dx = 0)
-  double* d_r;
-  CUDA_CHECK(cudaMalloc(&d_r, dim * sizeof(double)));
   cuda_copy(d_r, d_rhs, dim);
 
   // z = M^{-1} r
-  double* d_z;
-  CUDA_CHECK(cudaMalloc(&d_z, dim * sizeof(double)));
   cuda_precond_apply(d_diag_inv, d_r, d_z, N);
 
   // p = z
-  double* d_p;
-  CUDA_CHECK(cudaMalloc(&d_p, dim * sizeof(double)));
   cuda_copy(d_p, d_z, dim);
 
-  // Ap
-  double* d_Ap;
-  CUDA_CHECK(cudaMalloc(&d_Ap, dim * sizeof(double)));
-
-  double rz = cuda_dot(d_r, d_z, dim);
-  double rhs_norm2 = cuda_dot(d_rhs, d_rhs, dim);
+  double rz = fast_dot(d_r, d_z, dim, d_scratch);
+  double rhs_norm2 = fast_dot(d_rhs, d_rhs, dim, d_scratch);
   double rhs_norm = sqrt(rhs_norm2);
 
   if (rhs_norm < 1e-30) {
     cudaFree(d_r); cudaFree(d_z); cudaFree(d_p); cudaFree(d_Ap);
-    cudaFree(d_diag_inv);
+    cudaFree(d_scratch); cudaFree(d_diag_inv);
     return 0;
   }
 
@@ -652,22 +670,21 @@ int cuda_pcg_solve(const DeviceBSR& dbsr, const double* d_rhs,
     // Ap = H * p
     cuda_bsr_spmv(dbsr, d_p, d_Ap);
 
-    double pAp = cuda_dot(d_p, d_Ap, dim);
+    double pAp = fast_dot(d_p, d_Ap, dim, d_scratch);
     if (fabs(pAp) < 1e-30) break;
     double alpha = rz / pAp;
 
-    // dx += alpha * p
+    // dx += alpha * p, r -= alpha * Ap
     cuda_axpy(alpha, d_p, d_dx, dim);
-    // r -= alpha * Ap
     cuda_axpy(-alpha, d_Ap, d_r, dim);
 
-    double r_norm2 = cuda_dot(d_r, d_r, dim);
+    double r_norm2 = fast_dot(d_r, d_r, dim, d_scratch);
     if (sqrt(r_norm2) / rhs_norm < tol) { ++iters; break; }
 
     // z = M^{-1} r
     cuda_precond_apply(d_diag_inv, d_r, d_z, N);
 
-    double rz_new = cuda_dot(d_r, d_z, dim);
+    double rz_new = fast_dot(d_r, d_z, dim, d_scratch);
     double beta = rz_new / rz;
     rz = rz_new;
 
@@ -677,7 +694,7 @@ int cuda_pcg_solve(const DeviceBSR& dbsr, const double* d_rhs,
   }
 
   cudaFree(d_r); cudaFree(d_z); cudaFree(d_p); cudaFree(d_Ap);
-  cudaFree(d_diag_inv);
+  cudaFree(d_scratch); cudaFree(d_diag_inv);
   return iters;
 }
 
