@@ -376,6 +376,9 @@ double cuda_compute_error(DevicePoseGraph& dpg) {
 
 // ---- BSR SpMV kernel: one warp per block-row ------------------------------
 
+// BSR SpMV: 6 threads per block-row for full utilization.
+// Block size = 192 = 32 virtual rows * 6 threads/row.
+// Each group of 6 threads computes one row of y = H * x.
 __global__ void bsr_spmv_kernel(
     const int* __restrict__ row_ptr,
     const int* __restrict__ col_idx,
@@ -383,13 +386,13 @@ __global__ void bsr_spmv_kernel(
     const double* __restrict__ x,
     double* __restrict__ y,
     int num_block_rows) {
-  int row = blockIdx.x;
+  // 6 threads per row: threadIdx.x % 6 = element, threadIdx.x / 6 = local row
+  int elem = threadIdx.x % 6;
+  int local_row = threadIdx.x / 6;
+  int row = blockIdx.x * (blockDim.x / 6) + local_row;
   if (row >= num_block_rows) return;
 
-  int lane = threadIdx.x;  // 0..31 within warp
-  // Each thread handles some of the 6 output elements.
-
-  double acc[6] = {0, 0, 0, 0, 0, 0};
+  double acc = 0.0;
 
   int start = row_ptr[row];
   int end = row_ptr[row + 1];
@@ -399,24 +402,23 @@ __global__ void bsr_spmv_kernel(
     const double* blk = values + k * 36;
     const double* xj = x + col * 6;
 
-    // Each thread in the warp computes its share of the 6x6 block * 6-vector.
-    if (lane < 6) {
-      double s = 0.0;
-      for (int c = 0; c < 6; ++c) {
-        s += blk[lane * 6 + c] * xj[c];
-      }
-      acc[lane] += s;
+    // This thread computes row 'elem' of the 6x6 block-vector product.
+    double s = 0.0;
+    for (int c = 0; c < 6; ++c) {
+      s += blk[elem * 6 + c] * xj[c];
     }
+    acc += s;
   }
 
-  if (lane < 6) {
-    y[row * 6 + lane] = acc[lane];
-  }
+  y[row * 6 + elem] = acc;
 }
 
 void cuda_bsr_spmv(const DeviceBSR& dbsr, const double* d_x, double* d_y) {
-  // One block per block-row, 32 threads per block (one warp).
-  bsr_spmv_kernel<<<dbsr.num_block_rows, 32>>>(
+  // 192 threads per block = 32 rows per block, 6 threads per row.
+  const int threads = 192;
+  const int rows_per_block = threads / 6;
+  int blocks = (dbsr.num_block_rows + rows_per_block - 1) / rows_per_block;
+  bsr_spmv_kernel<<<blocks, threads>>>(
       dbsr.d_row_ptr, dbsr.d_col_idx, dbsr.d_values, d_x, d_y,
       dbsr.num_block_rows);
   CUDA_CHECK(cudaGetLastError());
