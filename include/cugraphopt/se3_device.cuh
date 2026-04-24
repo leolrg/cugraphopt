@@ -276,6 +276,104 @@ __host__ __device__ inline DSO3 dquat_to_SO3(double qx, double qy, double qz,
                 2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy)}}};
 }
 
+// ---- SE(3) Adjoint --------------------------------------------------------
+
+// Ad(T) for T = (R, t) in [rho; phi] convention:
+// Ad(T) = [[R, hat(t)*R], [0, R]]
+__host__ __device__ inline DMat6 dse3_adjoint(const DSE3& T) {
+  DMat3 tR = dmat3_multiply(dhat3(T.t), T.R.R);
+  DMat6 Ad;
+  for (int a = 0; a < 36; ++a) Ad.m[a] = 0.0;
+
+  // Upper-left 3x3: R
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      Ad.m[i * 6 + j] = T.R.R.m[i * 3 + j];
+
+  // Upper-right 3x3: hat(t) * R
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      Ad.m[i * 6 + (j + 3)] = tR.m[i * 3 + j];
+
+  // Lower-right 3x3: R
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      Ad.m[(i + 3) * 6 + (j + 3)] = T.R.R.m[i * 3 + j];
+
+  return Ad;
+}
+
+// ---- SE(3) left Jacobian inverse (6x6) -----------------------------------
+// Approximate using first-order BCH: J_l^{-1}(xi) ≈ I - 0.5 * ad(xi)
+// where ad(xi) is the 6x6 adjoint representation of xi in the Lie algebra.
+// More accurate than numerical Jacobians for small perturbations.
+
+// ad(xi) for xi = [rho; phi] is the 6x6 matrix:
+// ad(xi) = [[hat(phi), hat(rho)], [0, hat(phi)]]
+__host__ __device__ inline DMat6 dse3_ad(const DVec6& xi) {
+  DVec3 rho = {{xi[0], xi[1], xi[2]}};
+  DVec3 phi = {{xi[3], xi[4], xi[5]}};
+  DMat3 hat_phi = dhat3(phi);
+  DMat3 hat_rho = dhat3(rho);
+
+  DMat6 ad;
+  for (int a = 0; a < 36; ++a) ad.m[a] = 0.0;
+
+  // Upper-left: hat(phi)
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      ad.m[i * 6 + j] = hat_phi.m[i * 3 + j];
+
+  // Upper-right: hat(rho)
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      ad.m[i * 6 + (j + 3)] = hat_rho.m[i * 3 + j];
+
+  // Lower-right: hat(phi)
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      ad.m[(i + 3) * 6 + (j + 3)] = hat_phi.m[i * 3 + j];
+
+  return ad;
+}
+
+// J_l^{-1}(xi) ≈ I - 0.5 * ad(xi) + (1/12) * ad(xi)^2
+__host__ __device__ inline DMat6 dse3_left_jacobian_inv(const DVec6& xi) {
+  DMat6 I;
+  for (int a = 0; a < 36; ++a) I.m[a] = 0.0;
+  for (int a = 0; a < 6; ++a) I.m[a * 6 + a] = 1.0;
+
+  DMat6 ad_xi = dse3_ad(xi);
+  DMat6 ad2 = dmat6_multiply(ad_xi, ad_xi);
+
+  // J_l^{-1} = I - 0.5 * ad + (1/12) * ad^2
+  DMat6 result;
+  for (int a = 0; a < 36; ++a) {
+    result.m[a] = I.m[a] - 0.5 * ad_xi.m[a] + (1.0 / 12.0) * ad2.m[a];
+  }
+  return result;
+}
+
+// ---- Analytical Jacobians ------------------------------------------------
+
+__host__ __device__ inline void dcompute_jacobians_analytical(
+    const DSE3& T_i, const DSE3& T_j, const DSE3& Z_ij,
+    const DVec6& r,  // pre-computed residual
+    DMat6& J_i, DMat6& J_j) {
+  // J_i = -J_l^{-1}(r) * Ad(Z^{-1})
+  DMat6 Jl_inv_r = dse3_left_jacobian_inv(r);
+  DSE3 Z_inv = dse3_inverse(Z_ij);
+  DMat6 Ad_Zinv = dse3_adjoint(Z_inv);
+  DMat6 neg_Jl_inv = Jl_inv_r;
+  for (int a = 0; a < 36; ++a) neg_Jl_inv.m[a] = -neg_Jl_inv.m[a];
+  J_i = dmat6_multiply(neg_Jl_inv, Ad_Zinv);
+
+  // J_j = J_r^{-1}(r) = J_l^{-1}(-r)
+  DVec6 neg_r;
+  for (int d = 0; d < 6; ++d) neg_r[d] = -r[d];
+  J_j = dse3_left_jacobian_inv(neg_r);
+}
+
 // ---- Residual + Jacobian (used by linearization kernels) ------------------
 
 __host__ __device__ inline DVec6 dcompute_residual(const DSE3& T_i,

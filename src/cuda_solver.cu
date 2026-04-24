@@ -231,6 +231,59 @@ void cuda_linearize_edges(DevicePoseGraph& dpg) {
   CUDA_CHECK(cudaGetLastError());
 }
 
+// ---- Analytical linearization kernel (no finite differences) ---------------
+
+__global__ void linearize_edges_analytical_kernel(
+    const double* __restrict__ poses,
+    const int* __restrict__ edge_from,
+    const int* __restrict__ edge_to,
+    const double* __restrict__ edge_meas,
+    const double* __restrict__ edge_info,
+    double* __restrict__ residuals,
+    double* __restrict__ J_i_out,
+    double* __restrict__ J_j_out,
+    double* __restrict__ errors,
+    int num_edges) {
+  int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= num_edges) return;
+
+  int i = edge_from[e];
+  int j = edge_to[e];
+
+  DSE3 T_i = load_pose(poses, i);
+  DSE3 T_j = load_pose(poses, j);
+  DSE3 Z_ij = load_measurement(edge_meas, e);
+
+  // Compute residual.
+  DVec6 r = dcompute_residual(T_i, T_j, Z_ij);
+  for (int d = 0; d < 6; ++d) residuals[e * 6 + d] = r[d];
+
+  // Compute analytical Jacobians.
+  DMat6 Ji, Jj;
+  dcompute_jacobians_analytical(T_i, T_j, Z_ij, r, Ji, Jj);
+  for (int a = 0; a < 36; ++a) J_i_out[e * 36 + a] = Ji.m[a];
+  for (int a = 0; a < 36; ++a) J_j_out[e * 36 + a] = Jj.m[a];
+
+  // Compute weighted error.
+  DMat6 omega;
+  dexpand_information(edge_info + e * 21, omega);
+  DVec6 omega_r = dmat6_vec(omega, r);
+  double err = 0.0;
+  for (int d = 0; d < 6; ++d) err += r[d] * omega_r[d];
+  errors[e] = err;
+}
+
+static void cuda_linearize_edges_analytical(DevicePoseGraph& dpg) {
+  int threads = 256;
+  int blocks = (dpg.num_edges + threads - 1) / threads;
+  linearize_edges_analytical_kernel<<<blocks, threads>>>(
+      dpg.d_poses, dpg.d_edge_from, dpg.d_edge_to,
+      dpg.d_edge_meas, dpg.d_edge_info,
+      dpg.d_residuals, dpg.d_J_i, dpg.d_J_j, dpg.d_errors,
+      dpg.num_edges);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 // ---- Assembly kernel: one thread per edge, process one color at a time ----
 
 __global__ void assemble_edges_kernel(
@@ -889,7 +942,7 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config) {
     cudaEventRecord(ev_start);
 
     // --- Linearize (GPU) ---
-    cuda_linearize_edges(dpg);
+    cuda_linearize_edges_analytical(dpg);
     cudaEventRecord(ev_lin);
 
     // --- Assemble (GPU, colored) ---
@@ -1102,7 +1155,7 @@ GNResult solve_lm_gpu(PoseGraph& graph, const GNConfig& config) {
     auto t_total_start = Clock::now();
 
     // --- Linearize + assemble ---
-    cuda_linearize_edges(dpg);
+    cuda_linearize_edges_analytical(dpg);
     cuda_assemble_colored(dpg, dbsr, d_gradient, coloring,
                           d_color_edges, d_color_offsets);
 
@@ -1152,7 +1205,7 @@ GNResult solve_lm_gpu(PoseGraph& graph, const GNConfig& config) {
     cuda_retract(dpg, d_dx);
 
     // --- Evaluate new error ---
-    cuda_linearize_edges(dpg);
+    cuda_linearize_edges_analytical(dpg);
     double new_error = cuda_compute_error(dpg);
 
     auto t_total_end = Clock::now();
