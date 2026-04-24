@@ -391,22 +391,42 @@ void cuda_assemble_colored(DevicePoseGraph& dpg, DeviceBSR& dbsr,
   }
 }
 
+// ---- Warp-level reduction -------------------------------------------------
+
+__device__ double warp_reduce_sum_impl(double val) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    val += __shfl_down_sync(0xffffffff, val, offset);
+  }
+  return val;
+}
+
 // ---- Error reduction ------------------------------------------------------
 
 __global__ void sum_reduce_kernel(const double* __restrict__ input,
                                    double* output, int n) {
-  extern __shared__ double sdata[];
-  int tid = threadIdx.x;
+  double sum = 0.0;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  sdata[tid] = (i < n) ? input[i] : 0.0;
-  __syncthreads();
+  int stride = blockDim.x * gridDim.x;
 
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s) sdata[tid] += sdata[tid + s];
-    __syncthreads();
+  for (; i < n; i += stride) {
+    sum += input[i];
   }
 
-  if (tid == 0) atomicAdd(output, sdata[0]);
+  sum = warp_reduce_sum_impl(sum);
+
+  __shared__ double warp_sums[8];
+  int warp_id = threadIdx.x / 32;
+  int lane = threadIdx.x % 32;
+
+  if (lane == 0) warp_sums[warp_id] = sum;
+  __syncthreads();
+
+  if (warp_id == 0) {
+    int num_warps = blockDim.x / 32;
+    sum = (lane < num_warps) ? warp_sums[lane] : 0.0;
+    sum = warp_reduce_sum_impl(sum);
+    if (lane == 0) atomicAdd(output, sum);
+  }
 }
 
 double cuda_compute_error(DevicePoseGraph& dpg) {
@@ -417,7 +437,7 @@ double cuda_compute_error(DevicePoseGraph& dpg) {
 
   int threads = 256;
   int blocks = (dpg.num_edges + threads - 1) / threads;
-  sum_reduce_kernel<<<blocks, threads, threads * sizeof(double)>>>(
+  sum_reduce_kernel<<<blocks, threads>>>(
       dpg.d_errors, d_total, dpg.num_edges);
   CUDA_CHECK(cudaGetLastError());
 
@@ -482,18 +502,33 @@ void cuda_bsr_spmv(const DeviceBSR& dbsr, const double* d_x, double* d_y) {
 __global__ void dot_kernel(const double* __restrict__ a,
                            const double* __restrict__ b,
                            double* result, int n) {
-  extern __shared__ double sdata[];
-  int tid = threadIdx.x;
+  double sum = 0.0;
   int i = blockIdx.x * blockDim.x + threadIdx.x;
-  sdata[tid] = (i < n) ? a[i] * b[i] : 0.0;
-  __syncthreads();
+  int stride = blockDim.x * gridDim.x;
 
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s) sdata[tid] += sdata[tid + s];
-    __syncthreads();
+  // Grid-stride loop for large arrays.
+  for (; i < n; i += stride) {
+    sum += a[i] * b[i];
   }
 
-  if (tid == 0) atomicAdd(result, sdata[0]);
+  // Warp-level reduction.
+  sum = warp_reduce_sum_impl(sum);
+
+  // Write warp results to shared memory.
+  __shared__ double warp_sums[8]; // max 256 threads / 32 = 8 warps
+  int warp_id = threadIdx.x / 32;
+  int lane = threadIdx.x % 32;
+
+  if (lane == 0) warp_sums[warp_id] = sum;
+  __syncthreads();
+
+  // First warp reduces all warp sums.
+  if (warp_id == 0) {
+    int num_warps = blockDim.x / 32;
+    sum = (lane < num_warps) ? warp_sums[lane] : 0.0;
+    sum = warp_reduce_sum_impl(sum);
+    if (lane == 0) atomicAdd(result, sum);
+  }
 }
 
 double cuda_dot(const double* d_a, const double* d_b, int dim) {
@@ -504,7 +539,7 @@ double cuda_dot(const double* d_a, const double* d_b, int dim) {
 
   int threads = 256;
   int blocks = (dim + threads - 1) / threads;
-  dot_kernel<<<blocks, threads, threads * sizeof(double)>>>(
+  dot_kernel<<<blocks, threads>>>(
       d_a, d_b, d_result, dim);
   CUDA_CHECK(cudaGetLastError());
 
@@ -669,7 +704,7 @@ static double fast_dot(const double* d_a, const double* d_b, int dim,
   CUDA_CHECK(cudaMemsetAsync(d_scratch, 0, sizeof(double)));
   int threads = 256;
   int blocks = (dim + threads - 1) / threads;
-  dot_kernel<<<blocks, threads, threads * sizeof(double)>>>(
+  dot_kernel<<<blocks, threads>>>(
       d_a, d_b, d_scratch, dim);
   double result;
   CUDA_CHECK(cudaMemcpy(&result, d_scratch, sizeof(double),
