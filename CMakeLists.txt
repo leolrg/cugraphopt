@@ -186,3 +186,16 @@ add_test(
 set_tests_properties(cugraphopt_cli_solve_gpu PROPERTIES
   PASS_REGULAR_EXPRESSION "converged"
 )
+
+find_library(CUSPARSE_LIB cusparse HINTS ${CMAKE_CUDA_IMPLICIT_LINK_DIRECTORIES})
+if(CUSPARSE_LIB)
+  add_executable(cugraphopt_spmv_bench
+    tests/spmv_bench.cu
+  )
+
+  target_link_libraries(cugraphopt_spmv_bench
+    PRIVATE
+      cugraphopt_core
+      ${CUSPARSE_LIB}
+  )
+endif()
