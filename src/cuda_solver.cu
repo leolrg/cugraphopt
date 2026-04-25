@@ -712,37 +712,95 @@ static double fast_dot(const double* d_a, const double* d_b, int dim,
   return result;
 }
 
-// ---- GPU PCG solver -------------------------------------------------------
+// ---- Fused PCG update kernel ----------------------------------------------
+// Combines: dx += alpha*p, r -= alpha*Ap, and computes r^T*r in one pass.
+// Eliminates separate axpy + dot kernel launches.
+
+__global__ void pcg_update_xr_kernel(
+    double* __restrict__ dx, const double* __restrict__ p,
+    double* __restrict__ r, const double* __restrict__ Ap,
+    double alpha, double* __restrict__ r_dot_r, int n) {
+  double local_rr = 0.0;
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+
+  for (; i < n; i += stride) {
+    dx[i] += alpha * p[i];
+    r[i] -= alpha * Ap[i];
+    local_rr += r[i] * r[i];
+  }
+
+  // Warp reduction.
+  local_rr = warp_reduce_sum_impl(local_rr);
+  __shared__ double warp_sums[8];
+  int warp_id = threadIdx.x / 32;
+  int lane = threadIdx.x % 32;
+  if (lane == 0) warp_sums[warp_id] = local_rr;
+  __syncthreads();
+  if (warp_id == 0) {
+    int nw = blockDim.x / 32;
+    local_rr = (lane < nw) ? warp_sums[lane] : 0.0;
+    local_rr = warp_reduce_sum_impl(local_rr);
+    if (lane == 0) atomicAdd(r_dot_r, local_rr);
+  }
+}
+
+// Fused: z = M^{-1}*r, then compute r^T*z (for rz_new).
+__global__ void pcg_precond_rz_kernel(
+    const double* __restrict__ diag_inv,
+    const double* __restrict__ r,
+    double* __restrict__ z,
+    double* __restrict__ rz_out,
+    int N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= N) return;
+
+  const double* blk = diag_inv + i * 36;
+  const double* ri = r + i * 6;
+  double* zi = z + i * 6;
+
+  double local_rz = 0.0;
+  for (int row = 0; row < 6; ++row) {
+    double s = 0.0;
+    for (int c = 0; c < 6; ++c) s += blk[row * 6 + c] * ri[c];
+    zi[row] = s;
+    local_rz += ri[row] * s;  // r_i * z_i
+  }
+
+  // Warp reduction for rz.
+  local_rz = warp_reduce_sum_impl(local_rz);
+  int lane = threadIdx.x % 32;
+  if (lane == 0) atomicAdd(rz_out, local_rz);
+}
+
+// Fused: p = z + beta*p, and compute p^T*(H*p_old) is not needed if we
+// use the standard CG recurrence. But we still need pAp = p^T * Ap.
+// We keep dot_kernel for pAp since it's the only remaining sync point.
+
+// ---- GPU PCG solver (fused) -----------------------------------------------
 
 int cuda_pcg_solve(const DeviceBSR& dbsr, const double* d_rhs,
                    double* d_dx, int dim, int max_iter, double tol) {
   int N = dbsr.num_block_rows;
 
-  // Pre-allocate all buffers at once.
+  // Pre-allocate all buffers.
   double* d_r;
   double* d_z;
   double* d_p;
   double* d_Ap;
-  double* d_scratch;  // persistent scalar for reductions
+  double* d_scratch;
   CUDA_CHECK(cudaMalloc(&d_r, dim * sizeof(double)));
   CUDA_CHECK(cudaMalloc(&d_z, dim * sizeof(double)));
   CUDA_CHECK(cudaMalloc(&d_p, dim * sizeof(double)));
   CUDA_CHECK(cudaMalloc(&d_Ap, dim * sizeof(double)));
-  CUDA_CHECK(cudaMalloc(&d_scratch, sizeof(double)));
+  CUDA_CHECK(cudaMalloc(&d_scratch, 3 * sizeof(double))); // rr, rz, pAp
 
-  // dx = 0
   cuda_fill(d_dx, 0.0, dim);
 
-  // Extract preconditioner.
   double* d_diag_inv = cuda_extract_diagonal_inv(dbsr);
 
-  // r = rhs (since dx = 0)
   cuda_copy(d_r, d_rhs, dim);
-
-  // z = M^{-1} r
   cuda_precond_apply(d_diag_inv, d_r, d_z, N);
-
-  // p = z
   cuda_copy(d_p, d_z, dim);
 
   double rz = fast_dot(d_r, d_z, dim, d_scratch);
@@ -755,26 +813,47 @@ int cuda_pcg_solve(const DeviceBSR& dbsr, const double* d_rhs,
     return 0;
   }
 
+  int threads = 256;
+  int blocks_vec = (dim + threads - 1) / threads;
+  int blocks_node = (N + threads - 1) / threads;
+
+  // Check convergence every check_interval iterations to reduce host syncs.
+  const int check_interval = 10;
+
   int iters;
   for (iters = 0; iters < max_iter; ++iters) {
     // Ap = H * p
     cuda_bsr_spmv(dbsr, d_p, d_Ap);
 
+    // pAp = p^T * Ap (need this on host for alpha)
     double pAp = fast_dot(d_p, d_Ap, dim, d_scratch);
     if (fabs(pAp) < 1e-30) break;
     double alpha = rz / pAp;
 
-    // dx += alpha * p, r -= alpha * Ap
-    cuda_axpy(alpha, d_p, d_dx, dim);
-    cuda_axpy(-alpha, d_Ap, d_r, dim);
+    // Fused: dx += alpha*p, r -= alpha*Ap, compute r^T*r
+    CUDA_CHECK(cudaMemsetAsync(d_scratch, 0, sizeof(double)));
+    pcg_update_xr_kernel<<<blocks_vec, threads>>>(
+        d_dx, d_p, d_r, d_Ap, alpha, d_scratch, dim);
+    CUDA_CHECK(cudaGetLastError());
 
-    double r_norm2 = fast_dot(d_r, d_r, dim, d_scratch);
-    if (sqrt(r_norm2) / rhs_norm < tol) { ++iters; break; }
+    // Check convergence periodically
+    if ((iters + 1) % check_interval == 0 || iters == max_iter - 1) {
+      double r_norm2;
+      CUDA_CHECK(cudaMemcpy(&r_norm2, d_scratch, sizeof(double),
+                            cudaMemcpyDeviceToHost));
+      if (sqrt(r_norm2) / rhs_norm < tol) { ++iters; break; }
+    }
 
-    // z = M^{-1} r
-    cuda_precond_apply(d_diag_inv, d_r, d_z, N);
+    // Fused: z = M^{-1}*r and compute rz_new = r^T*z
+    CUDA_CHECK(cudaMemsetAsync(d_scratch + 1, 0, sizeof(double)));
+    pcg_precond_rz_kernel<<<blocks_node, threads>>>(
+        d_diag_inv, d_r, d_z, d_scratch + 1, N);
+    CUDA_CHECK(cudaGetLastError());
 
-    double rz_new = fast_dot(d_r, d_z, dim, d_scratch);
+    double rz_new;
+    CUDA_CHECK(cudaMemcpy(&rz_new, d_scratch + 1, sizeof(double),
+                          cudaMemcpyDeviceToHost));
+
     double beta = rz_new / rz;
     rz = rz_new;
 
