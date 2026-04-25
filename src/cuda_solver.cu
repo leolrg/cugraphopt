@@ -260,7 +260,7 @@ __global__ void linearize_edges_analytical_kernel(
 
   // Compute analytical Jacobians.
   DMat6 Ji, Jj;
-  dcompute_jacobians_analytical(T_i, T_j, Z_ij, r, Ji, Jj);
+  dcompute_jacobians_analytical(Z_ij, r, Ji, Jj);
   for (int a = 0; a < 36; ++a) J_i_out[e * 36 + a] = Ji.m[a];
   for (int a = 0; a < 36; ++a) J_j_out[e * 36 + a] = Jj.m[a];
 

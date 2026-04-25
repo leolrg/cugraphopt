@@ -357,8 +357,7 @@ __host__ __device__ inline DMat6 dse3_left_jacobian_inv(const DVec6& xi) {
 // ---- Analytical Jacobians ------------------------------------------------
 
 __host__ __device__ inline void dcompute_jacobians_analytical(
-    const DSE3& T_i, const DSE3& T_j, const DSE3& Z_ij,
-    const DVec6& r,  // pre-computed residual
+    const DSE3& Z_ij, const DVec6& r,
     DMat6& J_i, DMat6& J_j) {
   // J_i = -J_l^{-1}(r) * Ad(Z^{-1})
   DMat6 Jl_inv_r = dse3_left_jacobian_inv(r);
