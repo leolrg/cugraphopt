@@ -459,10 +459,10 @@ __global__ void bsr_spmv_kernel(
     const double* __restrict__ x,
     double* __restrict__ y,
     int num_block_rows) {
-  // 6 threads per row: threadIdx.x % 6 = element, threadIdx.x / 6 = local row
   int elem = threadIdx.x % 6;
   int local_row = threadIdx.x / 6;
-  int row = blockIdx.x * (blockDim.x / 6) + local_row;
+  int rows_per_block = blockDim.x / 6;
+  int row = blockIdx.x * rows_per_block + local_row;
   if (row >= num_block_rows) return;
 
   double acc = 0.0;
@@ -475,7 +475,6 @@ __global__ void bsr_spmv_kernel(
     const double* blk = values + k * 36;
     const double* xj = x + col * 6;
 
-    // This thread computes row 'elem' of the 6x6 block-vector product.
     double s = 0.0;
     for (int c = 0; c < 6; ++c) {
       s += blk[elem * 6 + c] * xj[c];
