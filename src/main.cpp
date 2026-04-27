@@ -64,6 +64,22 @@ int main(int argc, char** argv) {
     return 0;
   }
 
+  if (argc == 3 && std::string(argv[1]) == "--solve-cudss") {
+    cugraphopt::PoseGraph graph = cugraphopt::load_pose_graph(argv[2]);
+    std::printf("Loaded: nodes=%zu edges=%zu\n", graph.nodes.size(),
+                graph.edges.size());
+
+    cugraphopt::GNConfig cfg;
+    cfg.max_iterations = 30;
+    cfg.verbose = true;
+
+    cugraphopt::GNResult res =
+        cugraphopt::solve_gauss_newton_cudss(graph, cfg);
+    std::printf("converged: %d iterations, error %.6e -> %.6e\n",
+                res.iterations, res.initial_error, res.final_error);
+    return 0;
+  }
+
   if (argc == 3 && std::string(argv[1]) == "--solve-lm") {
     cugraphopt::PoseGraph graph = cugraphopt::load_pose_graph(argv[2]);
     std::printf("Loaded: nodes=%zu edges=%zu\n", graph.nodes.size(),

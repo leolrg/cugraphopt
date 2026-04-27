@@ -25,6 +25,7 @@ add_library(cugraphopt_core
   src/bsr.cpp
   src/graph_color.cpp
   src/cuda_solver.cu
+  src/cudss_solver.cu
   src/core.cu
 )
 
@@ -33,10 +34,16 @@ set_target_properties(cugraphopt_core PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+find_library(CUDSS_LIB cudss HINTS /usr/lib/x86_64-linux-gnu)
+
 target_include_directories(cugraphopt_core
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+
+if(CUDSS_LIB)
+  target_link_libraries(cugraphopt_core PUBLIC ${CUDSS_LIB})
+endif()
 
 add_executable(cugraphopt
   src/main.cpp

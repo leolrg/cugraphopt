@@ -61,8 +61,11 @@ DeviceBSR create_device_bsr(const BSRMatrix& bsr);
 void free_device_bsr(DeviceBSR& dbsr);
 
 /// Launch CUDA kernel: compute residuals and Jacobians for all edges.
-/// One thread per edge.
+/// One thread per edge. Finite-difference Jacobians.
 void cuda_linearize_edges(DevicePoseGraph& dpg);
+
+/// Analytical Jacobian version (faster, no finite differences).
+void cuda_linearize_edges_analytical(DevicePoseGraph& dpg);
 
 /// Launch CUDA kernel: assemble BSR Hessian from per-edge Jacobians.
 /// Uses graph coloring: one kernel launch per color, lock-free writes.

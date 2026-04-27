@@ -13,4 +13,8 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config);
 /// Adds lambda * diag(H) to the Hessian for trust-region behavior.
 GNResult solve_lm_gpu(PoseGraph& graph, const GNConfig& config);
 
+/// GPU Gauss-Newton solver using cuDSS (NVIDIA sparse direct solver)
+/// instead of PCG. Exact solve each iteration -> fewer GN iterations needed.
+GNResult solve_gauss_newton_cudss(PoseGraph& graph, const GNConfig& config);
+
 }  // namespace cugraphopt

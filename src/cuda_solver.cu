@@ -273,7 +273,7 @@ __global__ void linearize_edges_analytical_kernel(
   errors[e] = err;
 }
 
-static void cuda_linearize_edges_analytical(DevicePoseGraph& dpg) {
+void cuda_linearize_edges_analytical(DevicePoseGraph& dpg) {
   int threads = 256;
   int blocks = (dpg.num_edges + threads - 1) / threads;
   linearize_edges_analytical_kernel<<<blocks, threads>>>(
