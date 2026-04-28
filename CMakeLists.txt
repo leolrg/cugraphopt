@@ -206,3 +206,12 @@ if(CUSPARSE_LIB)
       ${CUSPARSE_LIB}
   )
 endif()
+
+add_executable(cugraphopt_assembly_bench
+  tests/assembly_bench.cu
+)
+
+target_link_libraries(cugraphopt_assembly_bench
+  PRIVATE
+    cugraphopt_core
+)

@@ -74,6 +74,13 @@ void cuda_assemble_colored(DevicePoseGraph& dpg, DeviceBSR& dbsr,
                            const EdgeColoring& coloring,
                            const int* d_color_edges, const int* d_color_offsets);
 
+/// Baseline: naive atomicAdd assembly. All edges in one kernel launch,
+/// using atomicAdd for all Hessian and gradient writes to handle concurrent
+/// updates. Used as a baseline for comparing against the graph-colored
+/// lock-free approach.
+void cuda_assemble_atomic(DevicePoseGraph& dpg, DeviceBSR& dbsr,
+                          double* d_gradient);
+
 /// Compute total weighted error via parallel reduction.
 /// Returns error on host.
 double cuda_compute_error(DevicePoseGraph& dpg);

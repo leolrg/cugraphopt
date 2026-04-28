@@ -391,6 +391,95 @@ void cuda_assemble_colored(DevicePoseGraph& dpg, DeviceBSR& dbsr,
   }
 }
 
+// ---- Baseline: naive atomicAdd assembly kernel ----------------------------
+// All edges processed in parallel with one kernel launch. Multiple edges may
+// write to the same block-row simultaneously, so all writes use atomicAdd to
+// serialize concurrent updates. This serves as the baseline for measuring
+// the benefit of graph coloring (which avoids atomics entirely).
+
+__global__ void assemble_edges_atomic_kernel(
+    const int* __restrict__ edge_from,
+    const int* __restrict__ edge_to,
+    const double* __restrict__ residuals,
+    const double* __restrict__ J_i_all,
+    const double* __restrict__ J_j_all,
+    const double* __restrict__ edge_info,
+    double* bsr_values,
+    double* gradient,
+    const int* __restrict__ block_map,
+    int N, int num_edges) {
+  int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= num_edges) return;
+
+  int i = edge_from[e];
+  int j = edge_to[e];
+
+  // Load Jacobians.
+  DMat6 Ji, Jj;
+  for (int a = 0; a < 36; ++a) Ji.m[a] = J_i_all[e * 36 + a];
+  for (int a = 0; a < 36; ++a) Jj.m[a] = J_j_all[e * 36 + a];
+
+  // Load residual.
+  DVec6 r;
+  for (int d = 0; d < 6; ++d) r[d] = residuals[e * 6 + d];
+
+  // Load information matrix.
+  DMat6 omega;
+  dexpand_information(edge_info + e * 21, omega);
+
+  // Precompute Omega * J_i, Omega * J_j.
+  DMat6 omega_Ji = dmat6_multiply(omega, Ji);
+  DMat6 omega_Jj = dmat6_multiply(omega, Jj);
+  DVec6 omega_r = dmat6_vec(omega, r);
+
+  // All writes atomic — multiple edges may target the same block.
+  auto atomic_write_block = [&](int bi, int bj, const DMat6& block) {
+    int k = block_map[bi * N + bj];
+    double* dst = bsr_values + k * 36;
+    for (int a = 0; a < 36; ++a) atomicAdd(dst + a, block.m[a]);
+  };
+
+  DMat6 JitOJi = dmat6_multiply(dmat6_transpose(Ji), omega_Ji);
+  atomic_write_block(i, i, JitOJi);
+
+  DMat6 JitOJj = dmat6_multiply(dmat6_transpose(Ji), omega_Jj);
+  atomic_write_block(i, j, JitOJj);
+
+  DMat6 JjtOJi = dmat6_multiply(dmat6_transpose(Jj), omega_Ji);
+  atomic_write_block(j, i, JjtOJi);
+
+  DMat6 JjtOJj = dmat6_multiply(dmat6_transpose(Jj), omega_Jj);
+  atomic_write_block(j, j, JjtOJj);
+
+  // Gradient atomic accumulation.
+  for (int d = 0; d < 6; ++d) {
+    double gi = 0.0, gj = 0.0;
+    for (int k = 0; k < 6; ++k) {
+      gi += Ji.m[k * 6 + d] * omega_r[k];
+      gj += Jj.m[k * 6 + d] * omega_r[k];
+    }
+    atomicAdd(gradient + 6 * i + d, gi);
+    atomicAdd(gradient + 6 * j + d, gj);
+  }
+}
+
+void cuda_assemble_atomic(DevicePoseGraph& dpg, DeviceBSR& dbsr,
+                           double* d_gradient) {
+  int N = dpg.num_nodes;
+
+  // Zero BSR values and gradient.
+  CUDA_CHECK(cudaMemset(dbsr.d_values, 0, dbsr.nnz_blocks * 36 * sizeof(double)));
+  CUDA_CHECK(cudaMemset(d_gradient, 0, N * 6 * sizeof(double)));
+
+  int threads = 256;
+  int blocks = (dpg.num_edges + threads - 1) / threads;
+  assemble_edges_atomic_kernel<<<blocks, threads>>>(
+      dpg.d_edge_from, dpg.d_edge_to,
+      dpg.d_residuals, dpg.d_J_i, dpg.d_J_j, dpg.d_edge_info,
+      dbsr.d_values, d_gradient, dbsr.d_block_map, N, dpg.num_edges);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 // ---- Warp-level reduction -------------------------------------------------
 
 __device__ double warp_reduce_sum_impl(double val) {
