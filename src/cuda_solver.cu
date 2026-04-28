@@ -364,6 +364,7 @@ void cuda_assemble_colored(DevicePoseGraph& dpg, DeviceBSR& dbsr,
                            double* d_gradient,
                            const EdgeColoring& coloring,
                            const int* d_color_edges, const int* d_color_offsets) {
+  (void)d_color_offsets;
   int N = dpg.num_nodes;
 
   // Zero BSR values and gradient.
@@ -384,8 +385,8 @@ void cuda_assemble_colored(DevicePoseGraph& dpg, DeviceBSR& dbsr,
         dbsr.d_values, d_gradient, dbsr.d_block_map, N);
     CUDA_CHECK(cudaGetLastError());
 
-    // Sync between color classes to avoid races.
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // Kernels are launched into the default stream, so color classes execute
+    // in order without forcing a host/device round trip after every color.
 
     offset += num;
   }
@@ -1081,36 +1082,12 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config) {
   int N = static_cast<int>(graph.nodes.size());
   int dim = 6 * N;
 
-  // Build graph coloring on CPU (one-time cost).
-  EdgeColoring coloring = color_edges(graph);
-
   // Build BSR sparsity pattern on CPU.
   BSRMatrix bsr_host = bsr_symbolic(graph);
 
   // Transfer to GPU.
   DevicePoseGraph dpg = create_device_pose_graph(graph);
   DeviceBSR dbsr = create_device_bsr(bsr_host);
-
-  // Build flat color-edge list for GPU.
-  std::vector<int> flat_color_edges;
-  std::vector<int> color_offsets = {0};
-  for (int c = 0; c < coloring.num_colors; ++c) {
-    for (int e : coloring.color_edges[c]) {
-      flat_color_edges.push_back(e);
-    }
-    color_offsets.push_back(static_cast<int>(flat_color_edges.size()));
-  }
-
-  int* d_color_edges;
-  int* d_color_offsets;
-  CUDA_CHECK(cudaMalloc(&d_color_edges, flat_color_edges.size() * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_color_offsets, color_offsets.size() * sizeof(int)));
-  CUDA_CHECK(cudaMemcpy(d_color_edges, flat_color_edges.data(),
-                        flat_color_edges.size() * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_color_offsets, color_offsets.data(),
-                        color_offsets.size() * sizeof(int),
-                        cudaMemcpyHostToDevice));
 
   // Gradient on device.
   double* d_gradient;
@@ -1125,8 +1102,8 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config) {
   CUDA_CHECK(cudaMalloc(&d_rhs, dim * sizeof(double)));
 
   if (config.verbose) {
-    std::printf("GPU: %d nodes, %d edges, %d BSR blocks, %d colors\n",
-                N, dpg.num_edges, dbsr.nnz_blocks, coloring.num_colors);
+    std::printf("GPU: %d nodes, %d edges, %d BSR blocks, atomic assembly\n",
+                N, dpg.num_edges, dbsr.nnz_blocks);
   }
 
   cudaEvent_t ev_start, ev_lin, ev_asm, ev_solve, ev_retract;
@@ -1147,9 +1124,8 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config) {
     cuda_linearize_edges_analytical(dpg);
     cudaEventRecord(ev_lin);
 
-    // --- Assemble (GPU, colored) ---
-    cuda_assemble_colored(dpg, dbsr, d_gradient, coloring,
-                          d_color_edges, d_color_offsets);
+    // --- Assemble (GPU, atomic) ---
+    cuda_assemble_atomic(dpg, dbsr, d_gradient);
     cudaEventRecord(ev_asm);
 
     // Get error.
@@ -1198,14 +1174,8 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config) {
     cudaEventRecord(ev_solve);
     cudaEventSynchronize(ev_solve);
 
-    auto t_solve_end = Clock::now();
-    stats.solve_ms = std::chrono::duration<double, std::milli>(
-        t_solve_end - Clock::now() + std::chrono::milliseconds(0)).count();
-    // Approximate solve time from wall clock since CUDA events around PCG are tricky
-    {
-      auto now = Clock::now();
-      stats.solve_ms = asm_ms; // Will be updated below properly
-    }
+    // Approximate solve time from CUDA events below since PCG launches several
+    // kernels internally.
 
     // --- Retract (GPU) ---
     cuda_retract(dpg, d_dx);
@@ -1251,8 +1221,6 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config) {
   cudaFree(d_gradient);
   cudaFree(d_dx);
   cudaFree(d_rhs);
-  cudaFree(d_color_edges);
-  cudaFree(d_color_offsets);
   free_device_pose_graph(dpg);
   free_device_bsr(dbsr);
   cudaEventDestroy(ev_start);
@@ -1303,33 +1271,9 @@ GNResult solve_lm_gpu(PoseGraph& graph, const GNConfig& config) {
   int N = static_cast<int>(graph.nodes.size());
   int dim = 6 * N;
 
-  EdgeColoring coloring = color_edges(graph);
   BSRMatrix bsr_host = bsr_symbolic(graph);
   DevicePoseGraph dpg = create_device_pose_graph(graph);
   DeviceBSR dbsr = create_device_bsr(bsr_host);
-
-  // Build flat color-edge list.
-  std::vector<int> flat_color_edges;
-  for (int c = 0; c < coloring.num_colors; ++c) {
-    for (int e : coloring.color_edges[c]) {
-      flat_color_edges.push_back(e);
-    }
-  }
-  int* d_color_edges;
-  int* d_color_offsets;
-  std::vector<int> color_offsets = {0};
-  for (int c = 0; c < coloring.num_colors; ++c) {
-    color_offsets.push_back(color_offsets.back() +
-                            static_cast<int>(coloring.color_edges[c].size()));
-  }
-  CUDA_CHECK(cudaMalloc(&d_color_edges, flat_color_edges.size() * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_color_offsets, color_offsets.size() * sizeof(int)));
-  CUDA_CHECK(cudaMemcpy(d_color_edges, flat_color_edges.data(),
-                        flat_color_edges.size() * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_color_offsets, color_offsets.data(),
-                        color_offsets.size() * sizeof(int),
-                        cudaMemcpyHostToDevice));
 
   double* d_gradient;
   double* d_dx;
@@ -1344,8 +1288,8 @@ GNResult solve_lm_gpu(PoseGraph& graph, const GNConfig& config) {
   double prev_error = 1e30;
 
   if (config.verbose) {
-    std::printf("LM-GPU: %d nodes, %d edges, %d BSR blocks, %d colors\n",
-                N, dpg.num_edges, dbsr.nnz_blocks, coloring.num_colors);
+    std::printf("LM-GPU: %d nodes, %d edges, %d BSR blocks, atomic assembly\n",
+                N, dpg.num_edges, dbsr.nnz_blocks);
   }
 
   // Save poses for potential rollback.
@@ -1358,8 +1302,7 @@ GNResult solve_lm_gpu(PoseGraph& graph, const GNConfig& config) {
 
     // --- Linearize + assemble ---
     cuda_linearize_edges_analytical(dpg);
-    cuda_assemble_colored(dpg, dbsr, d_gradient, coloring,
-                          d_color_edges, d_color_offsets);
+    cuda_assemble_atomic(dpg, dbsr, d_gradient);
 
     double total_error = cuda_compute_error(dpg);
 
@@ -1461,8 +1404,6 @@ GNResult solve_lm_gpu(PoseGraph& graph, const GNConfig& config) {
   cudaFree(d_gradient);
   cudaFree(d_dx);
   cudaFree(d_rhs);
-  cudaFree(d_color_edges);
-  cudaFree(d_color_offsets);
   free_device_pose_graph(dpg);
   free_device_bsr(dbsr);
 

@@ -128,43 +128,21 @@ GNResult solve_gauss_newton_cudss(PoseGraph& graph, const GNConfig& config) {
   int N = static_cast<int>(graph.nodes.size());
   int dim = 6 * N;
 
-  // Build coloring + BSR pattern on CPU.
-  EdgeColoring coloring = color_edges(graph);
+  // Build BSR pattern on CPU.
   BSRMatrix bsr_host = bsr_symbolic(graph);
 
   // Build CSR pattern from BSR.
   CSRMatrix csr = bsr_to_csr_pattern(bsr_host);
 
   if (config.verbose) {
-    std::printf("cuDSS-GPU: %d nodes, %d edges, BSR %d blocks, CSR nnz=%lld, %d colors\n",
+    std::printf("cuDSS-GPU: %d nodes, %d edges, BSR %d blocks, CSR nnz=%lld, atomic assembly\n",
                 N, (int)graph.edges.size(), bsr_host.nnz_blocks,
-                (long long)csr.nnz, coloring.num_colors);
+                (long long)csr.nnz);
   }
 
   // Transfer pose graph and BSR to device.
   DevicePoseGraph dpg = create_device_pose_graph(graph);
   DeviceBSR dbsr = create_device_bsr(bsr_host);
-
-  // Build flat color-edge list.
-  std::vector<int> flat_color_edges;
-  for (int c = 0; c < coloring.num_colors; ++c)
-    for (int e : coloring.color_edges[c])
-      flat_color_edges.push_back(e);
-  std::vector<int> color_offsets = {0};
-  for (int c = 0; c < coloring.num_colors; ++c)
-    color_offsets.push_back(color_offsets.back() +
-                            (int)coloring.color_edges[c].size());
-
-  int* d_color_edges;
-  int* d_color_offsets;
-  CUDA_CHECK(cudaMalloc(&d_color_edges, flat_color_edges.size() * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_color_offsets, color_offsets.size() * sizeof(int)));
-  CUDA_CHECK(cudaMemcpy(d_color_edges, flat_color_edges.data(),
-                        flat_color_edges.size() * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_color_offsets, color_offsets.data(),
-                        color_offsets.size() * sizeof(int),
-                        cudaMemcpyHostToDevice));
 
   // Allocate gradient, dx, rhs on device.
   double* d_gradient;
@@ -217,8 +195,7 @@ GNResult solve_gauss_newton_cudss(PoseGraph& graph, const GNConfig& config) {
   // First need to fill CSR values so cuDSS can do analysis.
   // We'll do a dummy linearize + assemble to get initial values.
   cuda_linearize_edges_analytical(dpg);
-  cuda_assemble_colored(dpg, dbsr, d_gradient, coloring,
-                        d_color_edges, d_color_offsets);
+  cuda_assemble_atomic(dpg, dbsr, d_gradient);
   cuda_gauge_fix(dbsr, d_gradient);
 
   // Expand BSR to CSR values.
@@ -249,8 +226,7 @@ GNResult solve_gauss_newton_cudss(PoseGraph& graph, const GNConfig& config) {
     // --- Linearize + assemble ---
     auto t0 = Clock::now();
     cuda_linearize_edges_analytical(dpg);
-    cuda_assemble_colored(dpg, dbsr, d_gradient, coloring,
-                          d_color_edges, d_color_offsets);
+    cuda_assemble_atomic(dpg, dbsr, d_gradient);
     auto t1 = Clock::now();
 
     double total_error = cuda_compute_error(dpg);
@@ -385,7 +361,6 @@ GNResult solve_gauss_newton_cudss(PoseGraph& graph, const GNConfig& config) {
   cudssDestroy(handle);
   cudaFree(d_gradient); cudaFree(d_dx); cudaFree(d_rhs);
   cudaFree(d_csr_row_ptr); cudaFree(d_csr_col_idx); cudaFree(d_csr_values);
-  cudaFree(d_color_edges); cudaFree(d_color_offsets);
   free_device_pose_graph(dpg);
   free_device_bsr(dbsr);
 
