@@ -284,6 +284,94 @@ void cuda_linearize_edges_analytical(DevicePoseGraph& dpg) {
   CUDA_CHECK(cudaGetLastError());
 }
 
+// ---- Fused analytical linearization + atomic assembly ---------------------
+
+__global__ void linearize_assemble_atomic_kernel(
+    const double* __restrict__ poses,
+    const int* __restrict__ edge_from,
+    const int* __restrict__ edge_to,
+    const double* __restrict__ edge_meas,
+    const double* __restrict__ edge_info,
+    double* __restrict__ errors,
+    double* bsr_values,
+    double* gradient,
+    const int* __restrict__ block_map,
+    int N, int num_edges) {
+  int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= num_edges) return;
+
+  int i = edge_from[e];
+  int j = edge_to[e];
+
+  DSE3 T_i = load_pose(poses, i);
+  DSE3 T_j = load_pose(poses, j);
+  DSE3 Z_ij = load_measurement(edge_meas, e);
+
+  DVec6 r = dcompute_residual(T_i, T_j, Z_ij);
+
+  DMat6 Ji, Jj;
+  dcompute_jacobians_analytical(Z_ij, r, Ji, Jj);
+
+  DMat6 omega;
+  dexpand_information(edge_info + e * 21, omega);
+
+  DMat6 omega_Ji = dmat6_multiply(omega, Ji);
+  DMat6 omega_Jj = dmat6_multiply(omega, Jj);
+  DVec6 omega_r = dmat6_vec(omega, r);
+
+  double err = 0.0;
+  for (int d = 0; d < 6; ++d) err += r[d] * omega_r[d];
+  errors[e] = err;
+
+  auto atomic_write_jt_omega_j = [&](int bi, int bj,
+                                     const DMat6& J_left,
+                                     const DMat6& omega_J_right) {
+    int k = block_map[bi * N + bj];
+    double* dst = bsr_values + k * 36;
+    for (int row = 0; row < 6; ++row) {
+      for (int col = 0; col < 6; ++col) {
+        double s = 0.0;
+        for (int q = 0; q < 6; ++q) {
+          s += J_left.m[q * 6 + row] * omega_J_right.m[q * 6 + col];
+        }
+        atomicAdd(dst + row * 6 + col, s);
+      }
+    }
+  };
+
+  atomic_write_jt_omega_j(i, i, Ji, omega_Ji);
+  atomic_write_jt_omega_j(i, j, Ji, omega_Jj);
+  atomic_write_jt_omega_j(j, i, Jj, omega_Ji);
+  atomic_write_jt_omega_j(j, j, Jj, omega_Jj);
+
+  for (int d = 0; d < 6; ++d) {
+    double gi = 0.0;
+    double gj = 0.0;
+    for (int k = 0; k < 6; ++k) {
+      gi += Ji.m[k * 6 + d] * omega_r[k];
+      gj += Jj.m[k * 6 + d] * omega_r[k];
+    }
+    atomicAdd(gradient + 6 * i + d, gi);
+    atomicAdd(gradient + 6 * j + d, gj);
+  }
+}
+
+void cuda_linearize_assemble_atomic(DevicePoseGraph& dpg, DeviceBSR& dbsr,
+                                    double* d_gradient) {
+  int N = dpg.num_nodes;
+  CUDA_CHECK(cudaMemset(dbsr.d_values, 0,
+                        dbsr.nnz_blocks * 36 * sizeof(double)));
+  CUDA_CHECK(cudaMemset(d_gradient, 0, N * 6 * sizeof(double)));
+
+  int threads = 256;
+  int blocks = (dpg.num_edges + threads - 1) / threads;
+  linearize_assemble_atomic_kernel<<<blocks, threads>>>(
+      dpg.d_poses, dpg.d_edge_from, dpg.d_edge_to,
+      dpg.d_edge_meas, dpg.d_edge_info, dpg.d_errors,
+      dbsr.d_values, d_gradient, dbsr.d_block_map, N, dpg.num_edges);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 // ---- Assembly kernel: one thread per edge, process one color at a time ----
 
 __global__ void assemble_edges_kernel(
@@ -1106,9 +1194,9 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config) {
                 N, dpg.num_edges, dbsr.nnz_blocks);
   }
 
-  cudaEvent_t ev_start, ev_lin, ev_asm, ev_solve, ev_retract;
+  cudaEvent_t ev_start, ev_fused, ev_asm, ev_solve, ev_retract;
   cudaEventCreate(&ev_start);
-  cudaEventCreate(&ev_lin);
+  cudaEventCreate(&ev_fused);
   cudaEventCreate(&ev_asm);
   cudaEventCreate(&ev_solve);
   cudaEventCreate(&ev_retract);
@@ -1120,12 +1208,9 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config) {
 
     cudaEventRecord(ev_start);
 
-    // --- Linearize (GPU) ---
-    cuda_linearize_edges_analytical(dpg);
-    cudaEventRecord(ev_lin);
-
-    // --- Assemble (GPU, atomic) ---
-    cuda_assemble_atomic(dpg, dbsr, d_gradient);
+    // --- Fused analytical linearize + atomic assemble (GPU) ---
+    cuda_linearize_assemble_atomic(dpg, dbsr, d_gradient);
+    cudaEventRecord(ev_fused);
     cudaEventRecord(ev_asm);
 
     // Get error.
@@ -1142,14 +1227,13 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config) {
     for (int i = 0; i < dim; ++i) grad_max = std::max(grad_max, std::abs(h_gradient[i]));
 
     cudaEventSynchronize(ev_asm);
-    float lin_ms, asm_ms;
-    cudaEventElapsedTime(&lin_ms, ev_start, ev_lin);
-    cudaEventElapsedTime(&asm_ms, ev_lin, ev_asm);
-    stats.linearize_ms = lin_ms + asm_ms;  // combine linearize + assemble
+    float fused_ms;
+    cudaEventElapsedTime(&fused_ms, ev_start, ev_fused);
+    stats.linearize_ms = fused_ms;
 
     if (config.verbose) {
-      std::printf("iter %3d  error=%.6e  |grad|_inf=%.6e  lin=%.1fms asm=%.1fms",
-                  iter, total_error, grad_max, lin_ms, asm_ms);
+      std::printf("iter %3d  error=%.6e  |grad|_inf=%.6e  fused=%.1fms",
+                  iter, total_error, grad_max, fused_ms);
     }
 
     if (grad_max < config.gradient_tolerance) {
@@ -1224,7 +1308,7 @@ GNResult solve_gauss_newton_gpu(PoseGraph& graph, const GNConfig& config) {
   free_device_pose_graph(dpg);
   free_device_bsr(dbsr);
   cudaEventDestroy(ev_start);
-  cudaEventDestroy(ev_lin);
+  cudaEventDestroy(ev_fused);
   cudaEventDestroy(ev_asm);
   cudaEventDestroy(ev_solve);
   cudaEventDestroy(ev_retract);
@@ -1300,9 +1384,8 @@ GNResult solve_lm_gpu(PoseGraph& graph, const GNConfig& config) {
     stats.iteration = iter;
     auto t_total_start = Clock::now();
 
-    // --- Linearize + assemble ---
-    cuda_linearize_edges_analytical(dpg);
-    cuda_assemble_atomic(dpg, dbsr, d_gradient);
+    // --- Fused analytical linearize + atomic assemble ---
+    cuda_linearize_assemble_atomic(dpg, dbsr, d_gradient);
 
     double total_error = cuda_compute_error(dpg);
 

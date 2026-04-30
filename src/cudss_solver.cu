@@ -194,8 +194,7 @@ GNResult solve_gauss_newton_cudss(PoseGraph& graph, const GNConfig& config) {
   // Analysis phase (symbolic factorization) — done once since pattern is fixed.
   // First need to fill CSR values so cuDSS can do analysis.
   // We'll do a dummy linearize + assemble to get initial values.
-  cuda_linearize_edges_analytical(dpg);
-  cuda_assemble_atomic(dpg, dbsr, d_gradient);
+  cuda_linearize_assemble_atomic(dpg, dbsr, d_gradient);
   cuda_gauge_fix(dbsr, d_gradient);
 
   // Expand BSR to CSR values.
@@ -225,8 +224,7 @@ GNResult solve_gauss_newton_cudss(PoseGraph& graph, const GNConfig& config) {
 
     // --- Linearize + assemble ---
     auto t0 = Clock::now();
-    cuda_linearize_edges_analytical(dpg);
-    cuda_assemble_atomic(dpg, dbsr, d_gradient);
+    cuda_linearize_assemble_atomic(dpg, dbsr, d_gradient);
     auto t1 = Clock::now();
 
     double total_error = cuda_compute_error(dpg);

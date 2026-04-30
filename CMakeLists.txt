@@ -215,3 +215,19 @@ target_link_libraries(cugraphopt_assembly_bench
   PRIVATE
     cugraphopt_core
 )
+
+add_executable(cugraphopt_fused_assembly_test
+  tests/fused_assembly_test.cu
+)
+
+target_link_libraries(cugraphopt_fused_assembly_test
+  PRIVATE
+    cugraphopt_core
+)
+
+target_compile_definitions(cugraphopt_fused_assembly_test
+  PRIVATE
+    CUGRAPHOPT_TEST_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+)
+
+add_test(NAME cugraphopt_fused_assembly_test COMMAND cugraphopt_fused_assembly_test)

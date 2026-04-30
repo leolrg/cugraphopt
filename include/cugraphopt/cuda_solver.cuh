@@ -67,6 +67,13 @@ void cuda_linearize_edges(DevicePoseGraph& dpg);
 /// Analytical Jacobian version (faster, no finite differences).
 void cuda_linearize_edges_analytical(DevicePoseGraph& dpg);
 
+/// Fused analytical linearization + atomic assembly.
+/// Computes residuals/Jacobians in registers, writes per-edge errors, and
+/// atomically accumulates Hessian/gradient without storing Jacobians to global
+/// memory first.
+void cuda_linearize_assemble_atomic(DevicePoseGraph& dpg, DeviceBSR& dbsr,
+                                    double* d_gradient);
+
 /// Launch CUDA kernel: assemble BSR Hessian from per-edge Jacobians.
 /// Uses graph coloring: one kernel launch per color, lock-free writes.
 void cuda_assemble_colored(DevicePoseGraph& dpg, DeviceBSR& dbsr,

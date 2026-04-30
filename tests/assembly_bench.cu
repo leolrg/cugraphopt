@@ -1,4 +1,8 @@
-/// Benchmark naive atomicAdd assembly vs graph-colored lock-free assembly.
+/// Benchmark assembly variants:
+/// - atomicAdd assembly after precomputed Jacobians
+/// - graph-colored lock-free assembly after precomputed Jacobians
+/// - two-kernel analytical linearization + atomicAdd assembly
+/// - fused analytical linearization + atomicAdd assembly
 
 #include "cugraphopt/bsr.hpp"
 #include "cugraphopt/cuda_solver.cuh"
@@ -76,6 +80,9 @@ int main(int argc, char** argv) {
   for (int i = 0; i < 5; ++i) {
     cuda_assemble_atomic(dpg, dbsr, d_gradient);
     cuda_assemble_colored(dpg, dbsr, d_gradient, coloring, d_color_edges, d_color_offsets);
+    cuda_linearize_edges_analytical(dpg);
+    cuda_assemble_atomic(dpg, dbsr, d_gradient);
+    cuda_linearize_assemble_atomic(dpg, dbsr, d_gradient);
   }
   CUDA_CHECK(cudaDeviceSynchronize());
 
@@ -116,6 +123,49 @@ int main(int argc, char** argv) {
   CUDA_CHECK(cudaMemcpy(h_grad_colored.data(), d_gradient, dim * sizeof(double),
                         cudaMemcpyDeviceToHost));
 
+  // ---- Two-kernel analytical linearize + atomic assembly ----
+  cudaEventRecord(start);
+  for (int i = 0; i < n_runs; ++i) {
+    cuda_linearize_edges_analytical(dpg);
+    cuda_assemble_atomic(dpg, dbsr, d_gradient);
+  }
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  float two_kernel_ms;
+  cudaEventElapsedTime(&two_kernel_ms, start, stop);
+  two_kernel_ms /= n_runs;
+
+  std::vector<double> h_bsr_two_kernel(dbsr.nnz_blocks * 36);
+  std::vector<double> h_grad_two_kernel(dim);
+  std::vector<double> h_err_two_kernel(dpg.num_edges);
+  CUDA_CHECK(cudaMemcpy(h_bsr_two_kernel.data(), dbsr.d_values,
+                        dbsr.nnz_blocks * 36 * sizeof(double), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_grad_two_kernel.data(), d_gradient, dim * sizeof(double),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_err_two_kernel.data(), dpg.d_errors,
+                        dpg.num_edges * sizeof(double), cudaMemcpyDeviceToHost));
+
+  // ---- Fused analytical linearize + atomic assembly ----
+  cudaEventRecord(start);
+  for (int i = 0; i < n_runs; ++i) {
+    cuda_linearize_assemble_atomic(dpg, dbsr, d_gradient);
+  }
+  cudaEventRecord(stop);
+  cudaEventSynchronize(stop);
+  float fused_ms;
+  cudaEventElapsedTime(&fused_ms, start, stop);
+  fused_ms /= n_runs;
+
+  std::vector<double> h_bsr_fused(dbsr.nnz_blocks * 36);
+  std::vector<double> h_grad_fused(dim);
+  std::vector<double> h_err_fused(dpg.num_edges);
+  CUDA_CHECK(cudaMemcpy(h_bsr_fused.data(), dbsr.d_values,
+                        dbsr.nnz_blocks * 36 * sizeof(double), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_grad_fused.data(), d_gradient, dim * sizeof(double),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(h_err_fused.data(), dpg.d_errors,
+                        dpg.num_edges * sizeof(double), cudaMemcpyDeviceToHost));
+
   // ---- Verify correctness ----
   double max_bsr_diff = 0.0, max_grad_diff = 0.0;
   for (int i = 0; i < dbsr.nnz_blocks * 36; ++i) {
@@ -127,17 +177,46 @@ int main(int argc, char** argv) {
     if (d > max_grad_diff) max_grad_diff = d;
   }
 
+  double max_fused_bsr_diff = 0.0;
+  double max_fused_grad_diff = 0.0;
+  double max_fused_err_diff = 0.0;
+  for (int i = 0; i < dbsr.nnz_blocks * 36; ++i) {
+    double d = std::abs(h_bsr_two_kernel[i] - h_bsr_fused[i]);
+    if (d > max_fused_bsr_diff) max_fused_bsr_diff = d;
+  }
+  for (int i = 0; i < dim; ++i) {
+    double d = std::abs(h_grad_two_kernel[i] - h_grad_fused[i]);
+    if (d > max_fused_grad_diff) max_fused_grad_diff = d;
+  }
+  for (int i = 0; i < dpg.num_edges; ++i) {
+    double d = std::abs(h_err_two_kernel[i] - h_err_fused[i]);
+    if (d > max_fused_err_diff) max_fused_err_diff = d;
+  }
+
   std::printf("\n--- Results (avg over %d runs) ---\n", n_runs);
-  std::printf("  atomicAdd assembly:     %.3f ms\n", atomic_ms);
-  std::printf("  graph-colored assembly: %.3f ms\n", colored_ms);
-  std::printf("  speedup (colored vs atomic): %.2fx\n", atomic_ms / colored_ms);
+  std::printf("  atomicAdd assembly only:            %.3f ms\n", atomic_ms);
+  std::printf("  graph-colored assembly only:        %.3f ms\n", colored_ms);
+  std::printf("  analytical linearize + atomicAdd:   %.3f ms\n", two_kernel_ms);
+  std::printf("  fused linearize + atomicAdd:        %.3f ms\n", fused_ms);
+  std::printf("  speedup (colored vs atomic asm):    %.2fx\n", atomic_ms / colored_ms);
+  std::printf("  speedup (fused vs two-kernel):      %.2fx\n", two_kernel_ms / fused_ms);
   std::printf("\n--- Correctness ---\n");
   std::printf("  max |H_atomic - H_colored|: %.3e\n", max_bsr_diff);
   std::printf("  max |b_atomic - b_colored|: %.3e\n", max_grad_diff);
+  std::printf("  max |H_two_kernel - H_fused|: %.3e\n", max_fused_bsr_diff);
+  std::printf("  max |b_two_kernel - b_fused|: %.3e\n", max_fused_grad_diff);
+  std::printf("  max |err_two_kernel - err_fused|: %.3e\n", max_fused_err_diff);
   if (max_bsr_diff < 1e-9 && max_grad_diff < 1e-9) {
     std::printf("  PASS: both assemblies produce identical results\n");
   } else {
     std::printf("  WARN: results differ (likely floating-point non-associativity)\n");
+  }
+  if (max_fused_bsr_diff < 1e-5 &&
+      max_fused_grad_diff < 1e-9 &&
+      max_fused_err_diff < 1e-9) {
+    std::printf("  PASS: fused linearize+assembly matches two-kernel path\n");
+  } else {
+    std::printf("  WARN: fused path differs from two-kernel path\n");
   }
 
   // Cleanup.
